@@ -48,3 +48,23 @@ Per the contract, key prompts/decisions are logged here for the judges' Q&A.
 - Plan locks execution order: Task 1 frozen header/build scaffold; Task 2 Phase 0 host sim + WAV/CSV/NDJSON harness; Task 3 S1 tests before code and REVIEW GATE 3; Task 4 S1 implementation + golden artifacts and S2 go/no-go; Task 5 TempDetune frontend and REVIEW GATE 4; Tasks 6-7 stretch S2/S3; Task 8 integration/rollback.
 - Plan records Track A data needs: `temp_c`, voice-0 intended `synth_hz` call-site redirect through `fx_detune_set_base`, `dt_s`, telemetry append of `detune_c`; S2 uses TIM7 at NVIC priority 8 with flag-only ISR.
 - Placeholder scan clean. Track A docs remain untracked and untouched by Track B.
+
+## Phase 0 — host simulator
+
+- Implemented `include/audio_engine.h` from the frozen contract.
+- Added isolated host-sim CMake build under `sim/`; Ninja was unavailable locally, so verified with CMake Makefiles (`cmake -S sim -B build-track-b-make`).
+- Implemented 4-voice sine phase-accumulator host simulator, RBJ biquad low-pass, master gain, manual little-endian WAV writer, and timestamped timeline harness.
+- Ran `sim/timelines/s1_temp_sweep.txt` through the harness. Outputs: `sim/artifacts/phase0/out.wav` (512044 bytes), `sim/artifacts/phase0/out.csv`, `sim/artifacts/phase0/telemetry.ndjson` (241 frames). S1 detune is still stubbed as 0.0; real detune comes after REVIEW GATE 3 tests.
+
+## Phase 4 shortcut — S1 functionality first
+
+- User requested skipping the full planned test-writing/golden-test phase due time pressure.
+- Kept a minimal smoke verification: CMake Makefile build, run harness, inspect telemetry at key timestamps.
+- Implemented `fx_detune`: first finite temp captures baseline; slope 15 cents/degC; clamp +/-75 cents; tau 0.4 s smoothing; invalid temps hold last cents; base_hz==0 inactive.
+- Harness now routes `base` events through `fx_detune_set_base`, samples temp at 30 Hz through `fx_detune_update`, and emits real `detune_c`.
+- Smoke run: t=0 detune 0.0/v0 440.0; t=3000ms detune ~69.34/v0 ~457.98; t=5000ms detune ~-63.71/v0 ~424.10; t=8000ms detune ~-0.50/v0 ~439.87. Artifacts saved under `sim/artifacts/s1/`.
+
+## Phase 5 shortcut — TempDetune frontend source
+
+- Added `src/showpiece/*` only: telemetry types, fixture replay hook, field guard, accessible SVG cents gauge, TempDetune panel, and standalone dev component source.
+- Clean Track B worktree has no `package.json` / Track A Vite app shell, so no npm build was run and no app scaffold was created. Components are ready to drop into Track A's app behind `IfField` when the shell exists.
