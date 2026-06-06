@@ -8,11 +8,28 @@ import { TelemetryChart } from './core/TelemetryChart';
 import { useSerialSource } from './core/useSerialSource';
 import { useTelemetryHistory } from './core/useTelemetryHistory';
 import type { SerialCommand, TelemetryFrame } from './core/types';
+import { TempDetune } from './showpiece/TempDetune';
+import type { TelemetryFrame as ShowpieceTelemetryFrame } from './showpiece/telemetry/types';
+
+function toShowpieceFrame(frame: TelemetryFrame | null): ShowpieceTelemetryFrame | null {
+  if (!frame || typeof frame.detune_c !== 'number') return null;
+
+  return {
+    t: frame.t,
+    temp_c: typeof frame.temp_c === 'number' ? frame.temp_c : undefined,
+    synth_hz: typeof frame.synth_hz === 'number' ? frame.synth_hz : undefined,
+    detune_c: frame.detune_c,
+    voices: frame.voices?.map((voice) => ({ hz: voice.hz ?? 0, g: voice.g ?? 0 })),
+    roll: typeof frame.roll === 'number' ? frame.roll : undefined,
+    pitch: typeof frame.pitch === 'number' ? frame.pitch : undefined,
+  };
+}
 
 export function App() {
   const { frames, latest, pushFrame } = useTelemetryHistory();
   const [replaying, setReplaying] = useState(true);
   const replayStartRef = useRef(Date.now());
+  const showpieceFrame = toShowpieceFrame(latest);
 
   const handleFrame = useCallback((frame: TelemetryFrame) => {
     pushFrame(frame);
@@ -37,11 +54,11 @@ export function App() {
     <main className="app-shell">
       <header className="hero">
         <div>
-          <p className="eyebrow">Track A · core dashboard</p>
-          <h1>Air-Synth telemetry</h1>
+          <p className="eyebrow">Combined Track A + Track B</p>
+          <h1>Air-Synth control room</h1>
           <p className="hero-copy">
-            Live Web Serial NDJSON for the NUCLEO-G474RE instrument, with replay mode when the board
-            is not connected.
+            Track A streams the playable instrument core. Track B adds the room-temperature detune
+            showpiece. This page proves both telemetry surfaces are wired together.
           </p>
         </div>
         <div className="hero-actions">
@@ -60,9 +77,25 @@ export function App() {
       {serial.error ? <div className="alert" role="alert">{serial.error}</div> : null}
       {!serial.supported ? <div className="alert" role="alert">Web Serial is available in Chrome/Edge on localhost or HTTPS.</div> : null}
 
-      <div className="dashboard-grid">
-        <StatusPanel latest={latest} connected={serial.connected} replaying={replaying && !serial.connected} />
-        <CommandBox disabled={!serial.connected} onSend={sendCommand} />
+      <div className="integrated-grid">
+        <div className="dashboard-stack">
+          <StatusPanel latest={latest} connected={serial.connected} replaying={replaying && !serial.connected} />
+          <CommandBox disabled={!serial.connected} onSend={sendCommand} />
+        </div>
+        <section className="panel showpiece-panel" aria-label="Track B room detune showpiece">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Track B S1</p>
+              <h2>Room detune showpiece</h2>
+            </div>
+            <span className={`pill ${showpieceFrame ? 'ok' : 'waiting'}`}>{showpieceFrame ? 'active' : 'waiting'}</span>
+          </div>
+          {showpieceFrame ? (
+            <TempDetune frame={showpieceFrame} />
+          ) : (
+            <p className="empty-state">Waiting for <code>detune_c</code> telemetry. Replay mode emits it now.</p>
+          )}
+        </section>
       </div>
 
       <MetricGrid latest={latest} />
