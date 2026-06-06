@@ -42,6 +42,16 @@ set(APP_SOURCES
     Core/Src/system_stm32g4xx.c
     Core/Src/stm32g4xx_it.c
     Core/Startup/startup_stm32g474xx.s
+    # Sensor drivers
+    src/sensors/mpu6050.c
+    src/sensors/mcp9808.c
+    src/sensors/hcsr04.c
+    src/sensors/bmp280.c
+    src/sensors/ads1115.c
+    # Application modules
+    src/mapping/mapping.c
+    src/telemetry/telemetry.c
+    src/bist/bist.c
 )
 
 # HAL sources (add only what is enabled in stm32g4xx_hal_conf.h)
@@ -73,6 +83,10 @@ file(GLOB HAL_SOURCES
 # ---- Include directories -----------------------------------------------
 set(INCLUDE_DIRS
     Core/Inc
+    src/sensors
+    src/mapping
+    src/telemetry
+    src/bist
     ${HAL_ROOT}/Inc
     ${CMSIS_ROOT}/Include
     ${CMSIS_ROOT}/Device/ST/STM32G4xx/Include
