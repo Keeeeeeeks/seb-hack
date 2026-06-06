@@ -63,3 +63,8 @@ Per the contract, key prompts/decisions are logged here for the judges' Q&A.
 - Implemented `fx_detune`: first finite temp captures baseline; slope 15 cents/degC; clamp +/-75 cents; tau 0.4 s smoothing; invalid temps hold last cents; base_hz==0 inactive.
 - Harness now routes `base` events through `fx_detune_set_base`, samples temp at 30 Hz through `fx_detune_update`, and emits real `detune_c`.
 - Smoke run: t=0 detune 0.0/v0 440.0; t=3000ms detune ~69.34/v0 ~457.98; t=5000ms detune ~-63.71/v0 ~424.10; t=8000ms detune ~-0.50/v0 ~439.87. Artifacts saved under `sim/artifacts/s1/`.
+
+## Phase 5 shortcut — TempDetune frontend source
+
+- Added `src/showpiece/*` only: telemetry types, fixture replay hook, field guard, accessible SVG cents gauge, TempDetune panel, and standalone dev component source.
+- Clean Track B worktree has no `package.json` / Track A Vite app shell, so no npm build was run and no app scaffold was created. Components are ready to drop into Track A's app behind `IfField` when the shell exists.
