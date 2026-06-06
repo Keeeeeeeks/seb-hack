@@ -305,3 +305,46 @@ hardware for S1.
 
 **Golden numbers for quick reference:** +75¢ → ×1.04427 (440 → 459.4 Hz); −75¢ → ×0.95762
 (440 → 421.4 Hz); slope 15¢/°C; rails at ±5 °C from baseline.
+
+---
+
+## 11. Spec-review refinements (self-review pass)
+
+> The automated critic agent timed out (infra), so a manual review against `SEB.MD` was performed.
+> Contract fidelity, S1 math, scope discipline, and consistency checked out. The following gaps were
+> found and are resolved here; where noted, these **supersede** the earlier text.
+
+### 11.1 AC3 hardened (supersedes the single-Goertzel S1-AC3)
+4 identical 440 Hz voices (a) cannot prove *each* voice was re-tuned — the test could false-pass with
+only voice 0 live — and (b) sum to ~4x amplitude → clipping corrupts the measurement. Split AC3:
+- **S1-AC3a (unit, `test_detune::all_voices_detuned`):** after `fx_detune_update` reaches
+  `detune_c=+75`, `sim_get_voice(v)` returns `base_hz[v]*2^(75/1200)` for **every** active voice v
+  (within ±0.1¢). This directly proves per-voice application.
+- **S1-AC3b (golden, `test_golden::chord_detuned`):** render a chord of **distinct** bases
+  (A3=220, C#4=277.18, E4=329.63, A4=440 Hz) at non-clipping gains; Goertzel detects each at
+  `note*2^(detune_c/1200)` within **±3¢**. Distinct bins make each voice independently observable in
+  the audio.
+
+### 11.2 Baseline & update edge cases (adds to S1-AC1)
+- `T_ref` is captured on the **first finite** `temp_c`; `NaN`/`Inf` readings are ignored (no capture,
+  hold current cents).
+- On a later sensor dropout (`NaN`), **hold** the last smoothed cents — do not recapture `T_ref` and
+  do not detune toward garbage. (On-target this pairs with the contract's `status.mcp` flag.)
+- If `dt_s <= 0`, skip the smoothing integration that frame and re-push unchanged frequencies.
+
+### 11.3 Disabled voices & sim normalization
+- Voices with `base_hz == 0` are inactive: `fx_detune` does **not** call `voice_set_freq` for them and
+  **never** touches their gain (gain belongs to the note source).
+- The harness sets per-voice gains + master so the summed mix stays within `[-1, 1]` (no clipping),
+  giving valid Goertzel amplitudes. The sim's `[-1, 1]` clamp is a **safety net**, not the normal
+  operating point.
+
+### 11.4 Precision note
+`+75¢` ratio = `2^(0.0625)` = **1.044274** → 440 Hz → **459.5 Hz** (the earlier "459.4" rounds here).
+`-75¢` ratio = **0.957603** → 440 Hz → **421.4 Hz**.
+
+### 11.5 Test-matrix updates
+| Criterion | Test |
+|-----------|------|
+| S1-AC3a per-voice math (introspection) | `test_detune::all_voices_detuned` |
+| S1-AC3b chord detected in audio | `test_golden::chord_detuned` |

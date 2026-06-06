@@ -29,3 +29,14 @@ Per the contract, key prompts/decisions are logged here for the judges' Q&A.
   approved. Spec written to docs/track-b-spec.md.
 
 **Status:** Spec drafted -> entering spec-review loop, then user review, then Phase 2 plan.
+
+## Phase 1 — review pass + branch note
+
+- **Branch reconciliation:** the shared working tree was switched to `keeks-tracka-appA-test` by a
+  parallel session (same team, confirmed by user). Per user instruction, Track B continues on
+  `keeks-tracka-appA-test`; the `track-b` spec commit (74125ed) was fast-forwarded onto it so `docs/`
+  is present. `track-b` branch retains the work too.
+- **Spec review:** automated critic agent timed out (infra). Manual review against `SEB.MD` done —
+  contract fidelity / S1 math / scope / consistency OK. Refinements applied (spec §11): AC3 hardened
+  (per-voice introspection + distinct-frequency chord, avoids false-pass & clipping); baseline NaN/
+  dropout handling; disabled-voice + sim-normalization rules; precision (+75¢ → 459.5 Hz).
