@@ -1,589 +1,308 @@
-# Track A — Air-Synth Firmware Specification
-**Branch:** `track-a` | **Phase 1 / Gate 1**
-**Target:** STM32G474RET6 on NUCLEO-G474RE (MB1367)
-**Author:** Seb agent
+# Track A — Air-Synth Core Spec (Phase 1)
+
+> Binding parent: `SEB.MD` SHARED CONTRACT (pin map, frozen `audio_engine.h`, telemetry/command
+> schema, git rules). This document is the artifact for **REVIEW GATE 1**.
+>
+> **Track A owns** the physical board (NUCLEO-G474RE), the integration trunk, and `src/core/*` in the
+> frontend. It delivers the Air-Synth instrument in always-demoable layers:
+> **M1 "Reliable Hum"** (Approach 1) -> **M2 "CORDIC Synth"** (Approach 2).
+>
+> **Frozen seam:** Track A *implements* `audio_engine.h` on-target. Track B builds on top of it
+> (host-sim + showpiece panels) and merges in at T-45. Track A must keep the seam signature frozen.
 
 ---
 
-## Overview
+## 0. Milestone overview
 
-Air-Synth is a gesture/distance-controlled musical instrument. Hand height (HC-SR04 ultrasonic)
-and IMU tilt (MPU-6050) drive a real-time audio synthesiser rendered on the STM32G4's DSP
-silicon (CORDIC oscillator + FMAC IIR filter + DAC/DMA). A servo and LED provide visual
-expression. Telemetry streams over LPUART1 to a Web Serial browser dashboard.
+| Milestone | Headline | Audio path | Demoable result |
+|-----------|----------|------------|-----------------|
+| **M0** (bring-up, no gate) | Blink + heartbeat | none | LD2 blinks; `{"t":..,"hb":1}` JSON on serial @115200 |
+| **M1** "Reliable Hum" | Sensors + simple tone | TIM/PWM or basic DAC tone, pitch=f(distance), octave/gate=f(tilt) | Hand height bends pitch; tilt gates/octaves; servo+LED VU; full telemetry; `selftest` BIST |
+| **M2** "CORDIC Synth" | DSP-silicon voice | CORDIC sine wavetable -> DAC1/TIM6/DMA; FMAC IIR LPF cutoff=f(tilt); vibrato/vol=f(tilt) | Clean parameterized voice via `audio_engine.h` (voice 0), filter sweeps with tilt |
 
-Firmware is delivered in two milestones, each independently demoable:
-
-| Milestone | Codename | Audio engine | Gate |
-|-----------|----------|--------------|------|
-| M1 | "Reliable Hum" | Basic DAC tone (TIM-driven PWM/DAC) | Gate 1 |
-| M2 | "CORDIC Synth" | CORDIC wavetable → DAC DMA + FMAC IIR | Gate 2 |
+Each milestone is independently flashable and demoable. M1 ships first and remains the fallback demo
+if M2 DSP work runs long.
 
 ---
 
-## Hardware Reference (authoritative pin map — do not reassign)
-
-| Signal | Pin | Peripheral | Notes |
-|--------|-----|------------|-------|
-| LPUART1 TX | PA2 | LPUART1 | 115 200 8N1 → ST-LINK VCP |
-| LPUART1 RX | PA3 | LPUART1 | |
-| DAC audio out | PA4 | DAC1_OUT1 | ⚠ NEVER PA5 (LD2 LED) |
-| Status LED | PA5 | GPIO out | On-board LD2 |
-| Servo PWM | PB4 | TIM3_CH1 | 50 Hz, 1.0–2.0 ms |
-| HC-SR04 TRIG | PB5 | GPIO out | 10 µs pulse |
-| HC-SR04 ECHO | PB6 | TIM4_CH1 | Input capture; 5V→3V3 divider |
-| I2C1 SCL | PB8 | I2C1 | 400 kHz Fast Mode |
-| I2C1 SDA | PB9 | I2C1 | MPU-6050 (0x68) + MCP9808 (0x18) |
-
----
-
-## Milestone 1 — "Reliable Hum"
-
-### 1.1 Scope
-
-Bring up all sensors, produce an audible tone whose pitch tracks hand distance, add octave-gate
-from tilt, drive the servo as a VU meter, and stream full telemetry JSON at ~30 Hz.
-
-### 1.2 I2C1 — 400 kHz Fast Mode
-
-**Bus:** SCL = PB8, SDA = PB9. External 4.7 kΩ pull-ups to 3V3 required.
-HAL I2C1 configured for 400 kHz (TIMINGR computed by CubeMX for 170 MHz PCLK1).
-
-#### MPU-6050 (address 0x68)
-
-| Step | Register | Addr | Expected / Action |
-|------|----------|------|-------------------|
-| Verify | WHO_AM_I | 0x75 | Read → must equal 0x68 |
-| Wake | PWR_MGMT_1 | 0x6B | Write 0x00 (clear SLEEP bit) |
-| Config | ACCEL_CONFIG | 0x1C | Write 0x00 (±2 g, AFS_SEL=0, 16384 LSB/g) |
-| Read | ACCEL_XOUT_H | 0x3B | Burst-read 14 bytes: AX_H, AX_L, AY_H, AY_L, AZ_H, AZ_L, TEMP_H, TEMP_L, GX_H, GX_L, GY_H, GY_L, GZ_H, GZ_L |
-
-**Burst-read protocol:** I2C repeated-start, device address 0x68 + write, register 0x3B, repeated-start,
-device address 0x68 + read, 14 bytes, NACK on last byte, STOP.
-
-**Accel → roll/pitch (small-angle, no gyro fusion for M1):**
-
-```
-ax_g = (int16_t)((buf[0]<<8)|buf[1]) / 16384.0f   // ±2 g range
-ay_g = (int16_t)((buf[2]<<8)|buf[3]) / 16384.0f
-az_g = (int16_t)((buf[4]<<8)|buf[5]) / 16384.0f
-
-roll_deg  = atan2f(ay_g, az_g) * (180.0f / M_PI)
-pitch_deg = atan2f(-ax_g, sqrtf(ay_g*ay_g + az_g*az_g)) * (180.0f / M_PI)
-```
-
-> **Note:** CORDIC atan2 (hardware) replaces `atan2f` in M2. For M1, use FPU `atan2f`.
-
-**MPU-6050 temperature (internal sensor, informational only):**
-```
-temp_c = (int16_t)((buf[6]<<8)|buf[7]) / 340.0f + 36.53f
-```
-This is the die temperature, not ambient. MCP9808 provides ambient.
-
-#### MCP9808 (address 0x18)
-
-| Step | Register | Addr | Expected |
-|------|----------|------|----------|
-| Verify Mfr ID | Manufacturer ID | 0x06 | Read 2 bytes → 0x0054 |
-| Verify Device ID | Device ID | 0x07 | Read 2 bytes → 0x0400 (upper byte = 0x04, lower = 0x00) |
-| Read temp | Ambient Temp | 0x05 | Read 2 bytes, parse below |
-
-**Tamb parse (register 0x05, 2 bytes MSB first):**
-```
-uint16_t raw = (buf[0] << 8) | buf[1];
-int sign     = (raw & 0x1000) ? -1 : 1;
-float temp_c = sign * (raw & 0x0FFF) / 16.0f;
-// Upper nibble bits [15:13] are alert flags — mask them off
-```
-
-**Failure handling (both sensors):**
-- If WHO_AM_I ≠ 0x68 or Mfr ID ≠ 0x0054: set `status.mpu` / `status.mcp` = 1, log error, continue.
-- On any HAL I2C error: increment `status.i2c_err`, retry once, then hold last valid reading.
-- Audio continues with last safe pitch/roll values — no crash, no mute.
-
-### 1.3 HC-SR04 — TIM4_CH1 Input Capture
-
-**Pins:** TRIG = PB5 (GPIO out, push-pull), ECHO = PB6 (TIM4_CH1 input, 5V→3V3 resistor divider).
-
-**Echo voltage divider:** 1 kΩ (HC-SR04 side) + 2 kΩ (GND side) → 3.33 V max on PB6. ✓
-
-**TIM4 configuration:**
-- Clock source: internal (APB1 timer clock = 170 MHz)
-- Prescaler: 169 → timer clock = 1 MHz (1 µs resolution)
-- Period (ARR): 0xFFFF (65535 µs max, covers 400 cm range)
-- Channel 1: input capture, rising edge → record `t_rise`; falling edge → record `t_fall`
-- Alternatively: configure CC1 for rising, CC2 (same pin, indirect) for falling — use TI1FP1/TI1FP2
-- IRQ: TIM4_IRQn, NVIC priority 1
-
-**Recommended IC approach (single channel, polarity toggle):**
-```c
-// On rising edge ISR: save CCR1, reconfigure for falling edge
-// On falling edge ISR: compute width = CCR1_fall - CCR1_rise (handle wrap)
-uint32_t echo_us = (t_fall >= t_rise) ? (t_fall - t_rise)
-                                       : (0xFFFF - t_rise + t_fall + 1);
-```
-
-**Trigger sequence (main loop, ≥60 ms between pings):**
-```
-PB5 HIGH for 10 µs → PB5 LOW → start TIM4 capture → wait for ISR
-```
-
-**Distance formula:**
-```
-distance_mm = (echo_us * 10) / 58   // integer arithmetic, result in mm
-// Equivalent: distance_cm = echo_us / 58; distance_mm = distance_cm * 10
-// Valid range: 20 mm – 4000 mm (HC-SR04 spec: 2 cm – 400 cm)
-```
-
-**Clamp:** `distance_mm = CLAMP(distance_mm, 20, 4000)`
-
-**Failure handling:**
-- No echo within 38 ms (timeout): set `status.sr04` = 1, hold last valid `distance_mm`.
-- On timeout: TIM4 capture disabled, re-enabled on next trigger cycle.
-- Audio holds last safe pitch — no crash.
-
-**Smoothing (1st-order IIR, α = 0.1):**
-```c
-dist_filt_mm = α * distance_mm + (1 - α) * dist_filt_mm;  // α = 0.1f
-```
-
-### 1.4 Servo — TIM3_CH1 (PB4)
-
-**Configuration:**
-- TIM3_CH1 = PB4 (AF2), PWM Mode 1
-- Prescaler: 169 → 1 MHz timer clock
-- ARR: 19999 → 50 Hz (20 ms period)
-- CCR1 range: 1000 (1.0 ms = 0°) … 2000 (2.0 ms = 180°)
-
-**Angle → CCR1:**
-```c
-uint32_t ccr = 1000 + (uint32_t)(angle_deg * (1000.0f / 180.0f));
-ccr = CLAMP(ccr, 1000, 2000);
-TIM3->CCR1 = ccr;
-```
-
-**Servo as VU meter (M1):**
-```
-servo_deg = CLAMP(dist_filt_mm / 4000.0f * 180.0f, 0.0f, 180.0f)
-```
-Closer hand → lower angle; farther → higher angle.
-
-**Failure handling:** If MPU or HC-SR04 fails, servo holds last position. No jitter.
-
-### 1.5 Basic DAC Tone (M1 Audio Engine)
-
-**Method:** TIM6 TRGO triggers DAC1_OUT1 (PA4) at a fixed sample rate. A simple square/sawtooth
-waveform is generated by software counter in the TIM6 IRQ (no DMA in M1 — DMA added in M2).
-
-**Alternatively (simpler M1):** Use TIM2 in PWM mode on a spare pin with RC filter, or use DAC
-with TIM6 IRQ and a simple counter-based sine approximation. The key deliverable is an audible
-tone at the correct pitch.
-
-**Pitch mapping — distance → frequency (log scale):**
-
-```
-// Input:  dist_filt_mm in [20, 4000] mm
-// Output: synth_hz in [110, 880] Hz
-// Log mapping: f = f_min * (f_max/f_min)^((d - d_min)/(d_max - d_min))
-
-float t = (dist_filt_mm - 20.0f) / (4000.0f - 20.0f);   // 0..1
-t = CLAMP(t, 0.0f, 1.0f);
-float synth_hz = 110.0f * powf(8.0f, t);                 // 110 * 8^t = 110..880 Hz
-synth_hz = CLAMP(synth_hz, 110.0f, 880.0f);
-```
-
-> Rationale: 880/110 = 8 = 2³ (three octaves). `powf(8, t)` gives perceptually uniform pitch sweep.
-
-**Octave gate — roll → pitch doubling:**
-```c
-if (fabsf(roll_deg) > 30.0f) {
-    synth_hz *= 2.0f;
-    synth_hz = CLAMP(synth_hz, 110.0f, 1760.0f);
-}
-```
-
-**Frequency smoothing (1st-order IIR, α = 0.1):**
-```c
-filt_hz = 0.1f * synth_hz + 0.9f * filt_hz;
-```
-
-**DAC output (M1 simple implementation):**
-- TIM6 configured at `filt_hz * N` where N = samples per cycle (e.g. N=32 for a wavetable).
-- In TIM6 IRQ: increment phase counter, output `wavetable[phase % N]` to DAC1->DHR12R1.
-- For M1 a simple 32-sample sine approximation (pre-computed at compile time) is sufficient.
-
-**Audio failure handling:**
-- If both MPU and HC-SR04 fail: `synth_hz` holds last safe value, audio continues at that pitch.
-- `status.audio` = 1 if DAC/TIM6 init fails.
-
-### 1.6 Telemetry — LPUART1 @ 115 200 8N1
-
-**Format:** Newline-delimited JSON (NDJSON), ~30 Hz, non-blocking TX.
-
-**JSON schema (M1 base):**
-```json
-{
-  "t": 12345,
-  "roll": -12.3,
-  "pitch": 4.5,
-  "ax": 0.01,
-  "ay": -0.98,
-  "az": 0.12,
-  "dist_mm": 350,
-  "temp_c": 23.4,
-  "synth_hz": 220.0,
-  "filt_hz": 215.3,
-  "servo_deg": 15.75,
-  "status": {"mpu": 0, "mcp": 0, "sr04": 0, "audio": 0, "servo": 0, "i2c_err": 0}
-}
-```
-
-**Field definitions:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `t` | uint32 ms | `HAL_GetTick()` timestamp |
-| `roll` | float °  | Roll from accel (±180°) |
-| `pitch` | float °  | Pitch from accel (±90°) |
-| `ax/ay/az` | float g | Raw accel in g |
-| `dist_mm` | int mm | Filtered HC-SR04 distance |
-| `temp_c` | float °C | MCP9808 ambient temperature |
-| `synth_hz` | float Hz | Pre-smoothing pitch |
-| `filt_hz` | float Hz | Post-smoothing pitch (drives DAC) |
-| `servo_deg` | float °  | Current servo angle |
-| `status.*` | int 0/1 | 0 = OK, 1 = fault |
-| `status.i2c_err` | int | Cumulative I2C error count |
-
-**TX implementation:**
-- 256-byte static ring buffer in SRAM.
-- `snprintf` into a local stack buffer (≤128 bytes), then copy to ring buffer.
-- LPUART1 TX DMA (or TX-empty IRQ) drains ring buffer — never blocks main loop.
-- If ring buffer full: drop frame (increment overflow counter, do not stall).
-
-**Command parser (RX):**
-- Line-buffered RX (LPUART1 RX IRQ or DMA).
-- Parse `{"cmd":"selftest"}` → trigger BIST.
-- Parse `{"cmd":"set","filt_hz":1200}` → override filter cutoff (M2).
-- Unknown commands: silently ignored.
-
-### 1.7 BIST — Serial Selftest
-
-Command: `{"cmd":"selftest"}` over LPUART1.
-
-**Sequence:**
-1. **I2C scan:** Probe 0x68 (MPU-6050) and 0x18 (MCP9808). Report found/not-found.
-2. **MPU WHO_AM_I:** Read reg 0x75 → verify 0x68. PASS/FAIL.
-3. **MCP9808 Mfr ID:** Read reg 0x06 → verify 0x0054. PASS/FAIL.
-4. **HC-SR04 ping:** Fire one trigger, wait up to 38 ms for echo. Report distance_mm or TIMEOUT.
-5. **DAC tone burst:** Output 440 Hz for 200 ms. Report PASS (no way to verify acoustically in SW).
-6. **Servo sweep:** Move to 0°, 90°, 180°, back to 0°. Report PASS.
-7. **LED test:** Blink PA5 three times.
-
-**Output format (one line per test):**
-```
-{"bist":"mpu_whoami","result":"PASS","val":"0x68"}
-{"bist":"mcp_mfrid","result":"PASS","val":"0x0054"}
-{"bist":"hcsr04","result":"PASS","val":"342mm"}
-{"bist":"dac_tone","result":"PASS"}
-{"bist":"servo","result":"PASS"}
-{"bist":"led","result":"PASS"}
-{"bist":"summary","pass":6,"fail":0}
-```
-
-**Status flags:** BIST sets `status.*` fields in telemetry for any FAIL result.
-
-### 1.8 M1 Acceptance Criteria
-
-| # | Criterion | Verification |
-|---|-----------|--------------|
-| AC-M1-1 | WHO_AM_I register reads 0x68 | BIST output + telemetry `status.mpu=0` |
-| AC-M1-2 | MCP9808 Mfr ID reads 0x0054 | BIST output + telemetry `status.mcp=0` |
-| AC-M1-3 | HC-SR04 returns plausible distance (20–4000 mm) | BIST ping + telemetry `dist_mm` |
-| AC-M1-4 | Servo sweeps 0°→90°→180° without stall | BIST servo test + visual |
-| AC-M1-5 | Audible tone changes pitch as hand moves | Acoustic + `synth_hz` in telemetry |
-| AC-M1-6 | Octave gate fires when |roll| > 30° | Tilt board, observe `synth_hz` doubles |
-| AC-M1-7 | Telemetry JSON flows at ~30 Hz | Count lines/sec on host |
-| AC-M1-8 | Sensor fault → status flag set, no crash | Unplug HC-SR04, observe `status.sr04=1` |
-| AC-M1-9 | `selftest` command triggers BIST | Send `{"cmd":"selftest"}`, read output |
-| AC-M1-10 | `temp_c` plausible (15–40 °C) | Telemetry field |
-
----
-
-## Milestone 2 — "CORDIC Synth"
-
-### 2.1 Scope
-
-Replace the M1 basic tone with a CORDIC-sine wavetable rendered via TIM6 TRGO + DAC DMA
-(circular). Add FMAC IIR low-pass filter with tilt-swept cutoff, vibrato from CORDIC LFO, and
-volume from distance. Implement the full `audio_engine.h` API.
-
-### 2.2 CORDIC Sine Wavetable
-
-**Wavetable:** 256 samples, `uint16_t`, 12-bit DAC range (0–4095).
-
-**Generation (at init, using STM32G4 CORDIC hardware):**
-```c
-// CORDIC configured: function=SINE, precision=6 iterations, width=32-bit, scale=0
-// Input: q1.31 angle in [-1, 1] representing [-π, π]
-// Output: q1.31 sine value in [-1, 1]
-
-for (int i = 0; i < 256; i++) {
-    int32_t angle_q31 = (int32_t)((i * 2 - 256) * (INT32_MAX / 256));
-    CORDIC->WDATA = (uint32_t)angle_q31;
-    int32_t sine_q31 = (int32_t)CORDIC->RDATA;
-    // Map [-1,1] q1.31 → [0, 4095] uint16_t
-    wavetable[i] = (uint16_t)((sine_q31 + INT32_MAX) >> 20);  // 12-bit
-}
-```
-
-**Placement:** `uint16_t wavetable[256]` in `.dma_buf` section (SRAM1, 4-byte aligned, accessible by DMA).
-
-**Linker section:**
-```ld
-.dma_buf (NOLOAD) :
-{
-    . = ALIGN(4);
-    *(.dma_buf)
-    . = ALIGN(4);
-} >SRAM1
-```
-
-### 2.3 TIM6 + DAC DMA (Circular)
-
-**TIM6 configuration:**
-- Clock: APB1 timer = 170 MHz
-- Prescaler: 0 (no prescale)
-- ARR: `(170000000 / 32000) - 1 = 5312 - 1 = 5311`
-- TRGO: Update event → triggers DAC1 conversion
-- Sample rate: 32 000 Hz (32 kHz)
-
-**DAC1_OUT1 (PA4) configuration:**
-- Trigger: TIM6 TRGO
-- DMA: DMA1 Channel (DAC1_CH1 request), circular mode, memory→peripheral
-- Transfer: `uint16_t` (half-word), 12-bit right-aligned (DHR12R1)
-- Buffer: `wavetable[256]` — DMA wraps continuously
-
-**Phase accumulator (updated in main loop or TIM6 IRQ — NOT in DMA TC IRQ):**
-```c
-// Phase step for desired frequency:
-// phase_step = (freq_hz * 256) / 32000
-// Updated atomically (32-bit write is atomic on Cortex-M4)
-volatile uint32_t phase_accum = 0;   // Q16.16 fixed-point
-volatile uint32_t phase_step  = 0;   // updated by audio_engine
-
-// In DMA half/complete callback (or TIM6 IRQ):
-// Refill output buffer from wavetable using phase_accum
-// For circular DMA of the raw wavetable, frequency is set by adjusting
-// the effective playback rate via a double-buffer or by recomputing
-// wavetable content at frequency change.
-```
-
-**Practical approach for frequency control with circular DMA:**
-- Use a **ping-pong (double) buffer** of 64 samples each.
-- DMA half-complete and complete callbacks refill the inactive half.
-- In the callback, advance `phase_accum += phase_step` per sample, index `wavetable[phase_accum >> 8]`.
-- `phase_step = (uint32_t)((freq_hz / 32000.0f) * 256.0f * 65536.0f)` (Q16.16).
-- Apply volume: `sample = (uint16_t)(wavetable[idx] * volume + 2048 * (1 - volume))` (centre at 2048).
-
-**NVIC:** DMA1 DAC audio = priority 0 (highest).
-
-### 2.4 FMAC IIR Low-Pass Filter
-
-**Hardware:** STM32G4 FMAC (Filter Math Accelerator), Direct Form 1, q15 coefficients.
-
-**Filter order:** 2nd-order Biquad (IIR DF1), sufficient for a smooth low-pass sweep.
-
-**Coefficient generation (Butterworth, computed on-the-fly in `filter_set_cutoff`):**
-```c
-// Bilinear transform, 2nd-order Butterworth low-pass
-// fs = 32000 Hz, fc = cutoff_hz
-// Pre-warp: wc = 2 * fs * tan(π * fc / fs)
-// Compute b0, b1, b2, a1, a2 in float, then convert to q15
-
-float wc = 2.0f * 32000.0f * tanf(M_PI * fc / 32000.0f);
-float K  = wc / 32000.0f;
-float K2 = K * K;
-float Q  = filter_q;   // default 0.707 (Butterworth)
-float norm = 1.0f + K/Q + K2;
-
-float b0 =  K2 / norm;
-float b1 =  2.0f * b0;
-float b2 =  b0;
-float a1 = (2.0f * (K2 - 1.0f)) / norm;
-float a2 = (1.0f - K/Q + K2) / norm;
-
-// Convert to q15 (scale by 32767, clamp)
-fmac_coeffs[0] = (int16_t)(b0 * 32767.0f);
-fmac_coeffs[1] = (int16_t)(b1 * 32767.0f);
-fmac_coeffs[2] = (int16_t)(b2 * 32767.0f);
-fmac_coeffs[3] = (int16_t)(-a1 * 32767.0f);  // FMAC uses negated a coeffs
-fmac_coeffs[4] = (int16_t)(-a2 * 32767.0f);
-```
-
-**FMAC buffers (SRAM1, q15, 64 samples each):**
-```c
-__attribute__((section(".dma_buf"), aligned(4)))
-int16_t fmac_input_buf[64];
-int16_t fmac_output_buf[64];
-int16_t fmac_coeff_buf[5];   // b0, b1, b2, -a1, -a2
-```
-
-**Cutoff mapping — pitch_deg → cutoff_hz:**
-```
-// pitch_deg in [-45°, +45°] → cutoff_hz in [400, 4000] Hz
-float t = (pitch_deg + 45.0f) / 90.0f;   // 0..1
-t = CLAMP(t, 0.0f, 1.0f);
-float cutoff_hz = 400.0f + t * (4000.0f - 400.0f);   // linear sweep
-cutoff_hz = CLAMP(cutoff_hz, 400.0f, 4000.0f);
-```
-
-**FMAC failure fallback:** If FMAC init returns error or produces NaN output, bypass filter
-(pass audio through unfiltered), set `status.audio` = 1. Ship CORDIC sine without filter.
-
-### 2.5 Vibrato
-
-**LFO:** 5 Hz sine via CORDIC (polled in main loop, not ISR).
+## 1. Frozen seam (from `SEB.MD` - implemented here, never re-signed)
 
 ```c
-// LFO phase advances at 5 Hz in main loop (~30 Hz tick)
-lfo_phase += (5.0f / 30.0f) * 256.0f;   // advance through 256-sample table
-if (lfo_phase >= 256.0f) lfo_phase -= 256.0f;
-
-// CORDIC sine of lfo_phase → lfo_sine in [-1, 1]
-float lfo_sine = cordic_sine_fast(lfo_phase);
-
-// Vibrato depth: depth_cents = |roll_deg| * (10.0f / 45.0f)
-float depth_cents = fabsf(roll_deg) * (10.0f / 45.0f);
-depth_cents = CLAMP(depth_cents, 0.0f, 10.0f);
-
-// Apply vibrato to frequency (cents → ratio: 2^(cents/1200))
-float vibrato_ratio = powf(2.0f, (depth_cents * lfo_sine) / 1200.0f);
-float vibrato_hz = synth_hz * vibrato_ratio;
-voice_set_freq(0, vibrato_hz);
-```
-
-### 2.6 Volume — Distance Mapping
-
-```c
-// Closer → louder (inverse, clamped 0..1)
-// dist_filt_mm in [20, 4000] mm
-float volume = 1.0f - (dist_filt_mm - 20.0f) / (4000.0f - 20.0f);
-volume = CLAMP(volume, 0.0f, 1.0f);
-voice_set_gain(0, volume);
-```
-
-### 2.7 Audio Engine API (frozen seam — implements `audio_engine.h`)
-
-```c
-// audio_engine.h  — shared contract, do not modify signatures
-#define MAX_VOICES 4
-
-void  audio_init(uint32_t sample_rate_hz);
-// Initialises CORDIC wavetable, TIM6, DAC1, DMA, FMAC.
-// sample_rate_hz must be 32000.
-
-void  voice_set_freq(int v, float hz);
-// Sets voice v frequency. v=0 is the main voice (Track A drives v=0).
-// Thread-safe: updates volatile phase_step atomically.
-
-void  voice_set_gain(int v, float g);
-// Sets voice v gain [0..1]. Applied per-sample in DMA callback.
-
-void  filter_set_cutoff(float hz);
-// Recomputes FMAC biquad coefficients for new cutoff frequency.
-// Called from main loop only (not ISR).
-
+// audio_engine.h  (MAX_VOICES = 4)
+void  audio_init(uint32_t sample_rate_hz);   // 32000 on-target (TIM6 TRGO DAC clock)
+void  voice_set_freq(int v, float hz);       // A drives v=0; B uses 0..MAX_VOICES-1
+void  voice_set_gain(int v, float g);        // 0..1
+void  filter_set_cutoff(float hz);           // FMAC
 void  filter_set_q(float q);
-// Sets filter Q factor. Default 0.707 (Butterworth).
-
 void  audio_set_master_gain(float g);
-// Master gain [0..1] applied after mixing all voices.
+// rendering is timer/DMA driven internally (CORDIC sine -> wavetable -> DAC DMA)
 ```
 
-**Voice struct (internal):**
-```c
-typedef struct {
-    volatile uint32_t phase_accum;   // Q16.16
-    volatile uint32_t phase_step;    // Q16.16, updated atomically
-    volatile float    gain;          // 0..1
-    volatile uint8_t  active;
-} Voice;
-
-static Voice voices[MAX_VOICES];
-```
-
-**Rendering (DMA half/complete callback):**
-```c
-// Mix MAX_VOICES voices, apply FMAC filter, apply master gain
-for (int s = 0; s < HALF_BUF; s++) {
-    int32_t mix = 0;
-    for (int v = 0; v < MAX_VOICES; v++) {
-        if (!voices[v].active) continue;
-        uint8_t idx = voices[v].phase_accum >> 16;  // top 8 bits of Q16.16
-        mix += (int32_t)(wavetable[idx] - 2048) * (int32_t)(voices[v].gain * 32767);
-        voices[v].phase_accum += voices[v].phase_step;
-    }
-    mix = mix / 32767;   // normalise
-    mix = (int32_t)(mix * master_gain);
-    fmac_input_buf[s] = (int16_t)CLAMP(mix, -2048, 2047);
-}
-// Submit fmac_input_buf to FMAC, read fmac_output_buf, write to dac_out_buf
-// (or bypass FMAC if not ready)
-```
-
-### 2.8 M2 Acceptance Criteria
-
-| # | Criterion | Verification |
-|---|-----------|--------------|
-| AC-M2-1 | 440 Hz sine audible from STEMMA speaker | Acoustic + `synth_hz≈440` in telemetry |
-| AC-M2-2 | FMAC filter cutoff sweeps with pitch tilt | Tilt board ±45°, observe tone brightness change |
-| AC-M2-3 | No audio glitches during telemetry TX | Monitor `filt_hz` continuity while streaming |
-| AC-M2-4 | Vibrato depth increases with |roll| | Roll board, listen for vibrato depth change |
-| AC-M2-5 | Volume increases as hand approaches | Move hand 20→4000 mm, observe loudness |
-| AC-M2-6 | `audio_engine.h` API compiles and links | Build succeeds, no undefined symbols |
-| AC-M2-7 | BIST 440 Hz burst passes | `{"cmd":"selftest"}` → `"dac_tone":"PASS"` |
-| AC-M2-8 | FMAC fallback: audio continues if FMAC fails | Force FMAC error in debug, verify audio continues |
+- **M1** may back this with a simple timer/PWM tone or basic DAC write (the "Reliable Hum"), as long
+  as the public signatures hold.
+- **M2** replaces the internals with the CORDIC->wavetable->DAC/DMA engine + FMAC filter. No caller
+  changes; only `audio_engine.c` internals change.
+- Header lives canonically at `include/audio_engine.h` (matches Track B's materialized copy; trivial
+  de-dupe at merge since the signature is frozen).
 
 ---
 
-## Sensor Failure Matrix
+## 2. Pin / peripheral map (authoritative, from `SEB.MD`)
 
-| Sensor | Failure Mode | Detection | Audio Behaviour | Telemetry |
-|--------|-------------|-----------|-----------------|-----------|
-| MPU-6050 | WHO_AM_I ≠ 0x68 | Init check | Hold last roll/pitch; no octave gate | `status.mpu=1` |
-| MPU-6050 | I2C NACK/timeout | HAL error | Hold last accel values | `status.i2c_err++` |
-| MCP9808 | Mfr ID ≠ 0x0054 | Init check | No effect on audio | `status.mcp=1` |
-| MCP9808 | I2C NACK/timeout | HAL error | No effect on audio | `status.i2c_err++` |
-| HC-SR04 | No echo (38 ms timeout) | TIM4 timeout | Hold last `dist_filt_mm` | `status.sr04=1` |
-| HC-SR04 | Out-of-range reading | Clamp check | Clamp to [20, 4000] mm | Normal |
-| DAC/TIM6 | Init failure | HAL error | Silent (muted) | `status.audio=1` |
-| FMAC | Init/coeff error | HAL error | Bypass filter, raw CORDIC sine | `status.audio=1` |
-| Servo | TIM3 init failure | HAL error | No effect on audio | `status.servo=1` |
+| Function | Peripheral | Pin(s) | Notes |
+|----------|-----------|--------|-------|
+| Telemetry UART | LPUART1 | PA2 TX / PA3 RX | 115200 8N1 -> ST-LINK VCP, **non-blocking TX** |
+| Audio out | DAC1_OUT1 | **PA4** | -> STEMMA speaker amp. NEVER PA5 |
+| Status LED | GPIO | PA5 (LD2) | heartbeat / VU |
+| I2C sensors | I2C1 | SCL PB8 / SDA PB9 | 400 kHz, 3V3, MPU-6050 @0x68 + MCP9808 @0x18 |
+| Servo | TIM3_CH1 | PB4 | 50 Hz PWM, 1.0-2.0 ms |
+| HC-SR04 trig | GPIO | PB5 | 10 us pulse |
+| HC-SR04 echo | TIM4_CH1 | PB6 | input capture IRQ, 5V->3V3 divider |
+| Extra LEDs (opt) | GPIO | PC7, PB3 | VU garnish |
 
----
-
-## Smoothing Summary
-
-| Signal | Filter | α | Notes |
-|--------|--------|---|-------|
-| `dist_filt_mm` | 1st-order IIR | 0.1 | Applied after clamp |
-| `filt_hz` | 1st-order IIR | 0.1 | Applied after octave gate |
-| `roll_deg` | None (M1) | — | Raw atan2 output |
-| `pitch_deg` | None (M1) | — | Raw atan2 output |
-| FMAC cutoff | Immediate | — | Coefficient recomputed on change |
+**Peripheral allocation:** TIM6 = audio sample clock (32 kHz TRGO); TIM3 = servo PWM; TIM4 = echo
+capture; DAC1 = audio; DMA1 = audio (+ optional LPUART TX); CORDIC = sine + atan2 (PHASE);
+FMAC = IIR LPF. TIM7 is intentionally **left free** for Track B's sequencer at integration.
 
 ---
 
-## Telemetry Rate Budget
+## 3. Sensor -> sound mapping math (ranges, clamps, smoothing)
 
-| Task | Period | Notes |
-|------|--------|-------|
-| Sensor read (I2C) | ~10 ms | MPU + MCP back-to-back |
-| HC-SR04 ping | 60 ms | Min cycle per datasheet |
-| Mapping + audio update | ~1 ms | Pure math |
-| Telemetry TX | ~33 ms | ~30 Hz, non-blocking |
-| Servo update | 20 ms | TIM3 PWM auto |
-| Audio DMA | 8 ms | 256 samples @ 32 kHz |
+All mappings clamp inputs to a working range, then apply a one-pole smoother
+`y += a*(target - y)` with `a = 1 - expf(-dt/tau)` (per-mapping `tau` below). `dt` is the sensor-loop
+period (~33 ms at 30 Hz). All smoothing is **clamp-then-smooth** so smoothed values never exceed
+rails.
 
-All tasks run in the main super-loop except audio (DMA/IRQ) and echo capture (TIM4 IRQ).
-No HAL_Delay in ISRs. No blocking I2C in audio callbacks.
+### 3.1 Distance -> pitch  (`synth_hz`, M1 + M2)
+- Source: HC-SR04 echo width -> `distance_mm` (see section 5.1).
+- Working range: **`D_MIN = 50 mm` ... `D_MAX = 500 mm`** (clamp outside).
+- Musical (exponential) map over **2 octaves**, base **A3 = 220 Hz**:
+  ```
+  d   = clamp(distance_mm, D_MIN, D_MAX)
+  u   = (d - D_MIN) / (D_MAX - D_MIN)        # 0..1, near hand = low by default
+  hz  = 220.0f * exp2f(OCTAVES * u)          # OCTAVES = 2.0 -> 220..880 Hz
+  ```
+  (Direction configurable; default: closer hand = lower pitch.)
+- Smoothing: `tau_pitch = 0.06 s` (responsive but de-jittered). Applied to `hz` (or to `u`).
+
+### 3.2 Tilt -> octave / gate  (M1)
+- Source: MPU-6050 accel -> roll/pitch (see section 5.2).
+- **Gate:** if `pitch_deg < GATE_OFF_DEG` (e.g. nose-down past -60deg) -> mute
+  (`audio_set_master_gain(0)` ramped); else gate on. Provides an intentional "silence" gesture and a
+  safe default.
+- **Octave shift:** quantize `roll_deg` into bins -> `octave in {-1, 0, +1}`; multiply `hz` by
+  `2^octave`. Hysteresis on bin edges to avoid flutter.
+
+### 3.3 Tilt -> filter cutoff (M2)
+- `pitch_deg` mapped to log-frequency cutoff:
+  ```
+  p    = clamp(pitch_deg, -45.0f, +45.0f)
+  uc   = (p + 45.0f) / 90.0f                 # 0..1
+  fc   = 200.0f * exp2f(uc * 5.32f)          # 200 Hz .. ~8 kHz (5.32 = log2(8000/200))
+  filter_set_cutoff(fc)
+  ```
+- Smoothing: `tau_cutoff = 0.10 s`. FMAC coefficients recomputed only when `fc` moves > 1 % (avoids
+  needless stop/restart, see section 6.3).
+
+### 3.4 Tilt -> vibrato / volume (M2)
+- `roll_deg` -> vibrato depth (0..~30 cents) and rate (~5 Hz LFO) and/or master gain trim. Vibrato
+  modulates voice-0 frequency around the mapped `hz`. `tau_vib = 0.12 s`.
+- Master gain stays <= 1.0; clamp to avoid DAC clipping.
+
+### 3.5 VU expression (M1)
+- Servo angle = f(amplitude or distance): `servo_deg = map(level, 0..1, 0..180)`, slew-limited.
+- LD2 / extra LEDs brightness or blink rate = f(level/gate).
+
+---
+
+## 4. Telemetry & command schema (contract - base set is Track A's responsibility)
+
+Newline-delimited JSON, ~30 Hz, **non-blocking TX** (DMA/IRQ ring buffer; must never stall audio).
+
+```json
+{"t":ms,"roll":f,"pitch":f,"ax":f,"ay":f,"az":f,"dist_mm":i,"temp_c":f,
+ "synth_hz":f,"filt_hz":f,"servo_deg":f,
+ "status":{"mpu":0,"mcp":0,"sr04":0,"audio":0,"servo":0,"i2c_err":0}}
+```
+- `status` flags: `0 = OK/present`, non-zero = fault/absent (also drives FE red indicators).
+- Track B extensions (`detune_c`, `seq`, `voices`) are appended later; older FE ignores unknown
+  fields. Track A leaves room but does not emit them in M1/M2.
+
+Commands (FE -> board, one JSON object per line):
+- `{"cmd":"selftest"}` -> run BIST, print PASS/FAIL per subsystem, set status flags.
+- `{"cmd":"set","filt_hz":1200}` / `{"cmd":"set","master":0.8}` -> parameter override.
+- (reserved) `{"cmd":"seq",...}` handled post-integration.
+
+---
+
+## 5. Sensor drivers - concrete config (from research)
+
+### 5.1 HC-SR04 (TIM4_CH1 input capture)
+- TIM4: **PSC = 169** -> 1 MHz (1 us/tick) at 170 MHz timer clock; **ARR = 65535** -> 65.5 ms window
+  (> 38 ms HC-SR04 timeout).
+- TRIG (PB5): drive a **10 us** high pulse to start a ping.
+- ECHO (PB6 = TIM4_CH1, AF2): capture rising edge (`t_rise`), flip polarity, capture falling edge
+  (`t_fall`). `echo_us = (t_fall - t_rise) & 0xFFFF`.
+- Distance: `distance_mm = (echo_us * 10) / 58` (58 us/cm). Valid 20-4000 mm.
+- **Timeout / no-echo:** no falling edge within 38 ms -> `status.sr04 = 1`, hold last value (audio
+  does not jump).
+- NVIC: `TIM4_IRQn` priority **1** (below audio DMA, above telemetry).
+
+### 5.2 MPU-6050 (I2C1 @ 0x68)
+- Init: `WHO_AM_I (0x75) == 0x68`; write `PWR_MGMT_1 (0x6B) = 0x00` (clear sleep);
+  `ACCEL_CONFIG (0x1C) = 0x00` (+-2 g, **16384 LSB/g**); `GYRO_CONFIG (0x1B) = 0x00` (+-250 deg/s).
+- Read: burst 14 bytes from `ACCEL_XOUT_H (0x3B)` -> ax,ay,az,temp,gx,gy,gz.
+- Tilt: `roll = atan2(ay, az)`, `pitch = atan2(-ax, sqrt(ay^2+az^2))`. **CORDIC PHASE** function
+  computes atan2 in hardware (q1.31) - preferred over software `atan2f`.
+- Fault: WHO_AM_I mismatch or NAK -> `status.mpu = 1`, freeze tilt at neutral (0deg), gate audio safe.
+
+### 5.3 MCP9808 (I2C1 @ 0x18)
+- Verify `MFR_ID (0x06) == 0x0054`, `DEV_ID (0x07)` high byte `== 0x04`.
+- Read `T_AMBIENT (0x05)` 16-bit: mask `& 0x1FFF`; if `& 0x1000` -> `temp_c = (w & 0x0FFF)*0.0625 - 256`
+  else `temp_c = w * 0.0625`. (0.0625 C/LSB.)
+- Fault: ID mismatch/NAK -> `status.mcp = 1`, `temp_c` holds last; Track B detune disabled downstream.
+
+### 5.4 SG90 servo (TIM3_CH1)
+- TIM3: **PSC = 169** (1 MHz), **ARR = 19999** -> exactly 50 Hz.
+- CCR (pulse us): 0deg -> **1000**, 90deg -> **1500**, 180deg -> **2000**.
+  `CCR = 1000 + (uint32_t)(angle_deg * 1000.0f / 180.0f)`, `angle in [0,180]`.
+
+---
+
+## 6. Audio engine - concrete config (M2, from research)
+
+### 6.1 CORDIC sine wavetable
+- CORDIC `FUNC = SINE`, `PRECISION = 6 cycles` (~20-bit), q1.31 in/out.
+- **Precompute once at startup** a **1024-entry `int16_t` (q1.15)** wavetable via CORDIC (DMA burst),
+  not per-sample. Cost 2 KB SRAM1. Phase angle scaling: map table index `i in [0,N)` to q1.31
+  `[-pi,pi)`.
+- Runtime oscillator = phase accumulator; `phase_inc = freq * N / 32000`; sample = `wavetable[phase >>
+  PHASE_SHIFT]`. (Pure integer in ISR.)
+
+### 6.2 DAC1 + TIM6 + DMA (32 kHz)
+- TIM6 TRGO: **PSC = 0, ARR = 5311** -> 32,012 Hz (0.04 % error); MMS = update->TRGO.
+- DAC1 CH1 (PA4): `TSEL = TIM6 TRGO`, `TEN1`, `DMAEN1`, `WAVE = 0` (manual feed), `EN1`.
+- DMA1 **Channel 3** (DMAMUX DAC1_CH1), circular, 16-bit, mem->periph, dest `&DAC1->DHR12R1`.
+- Double-buffer: `uint16_t audio_buf[2*64] __attribute__((aligned(4)))` in **SRAM1** (CCM is **not**
+  DMA-accessible). 64 samples/half = 2 ms latency. Half-transfer IRQ refills `[0..63]`,
+  transfer-complete IRQ refills `[64..127]`.
+- q1.15 -> 12-bit DAC: `dac_code = (uint16_t)((sample + 32768) >> 4)`.
+
+### 6.3 FMAC IIR low-pass (cutoff = f(tilt))
+- `FMAC_FUNC_IIR_DIRECT_FORM_1`, single biquad (B taps N=3, A taps M=2), `Clip = ENABLED`.
+- Coeffs: RBJ LPF at fs=32 k -> normalize by a0 -> **negate a1,a2** (FMAC wants -a) -> **prescale /2 with
+  gain R=1** (handles `|a1|>1` at low cutoff) -> q1.15.
+- Headroom: keep input <= -6 dB (<= 50 % full scale) since passband gain ~= 2^R.
+- Runtime sweep: `FilterStop -> FilterConfig(new coeffs) -> FilterPreload -> FilterStart`. 2-3 sample
+  glitch, inaudible at tilt update rates. Only recompute when `fc` changes > 1 %.
+- **Fallback (if FMAC unstable):** `arm_biquad_cascade_df1_f32` (CMSIS-DSP), same `{b0,b1,b2,-a1,-a2}`
+  convention, ~15-20 cycles/sample on M4F - ship CORDIC sine *without* hardware filter if needed.
+
+---
+
+## 7. Failure behavior (graceful degradation - per `SEB.MD`)
+
+| Condition | Detection | Telemetry | Audio/actuator response |
+|-----------|-----------|-----------|-------------------------|
+| MPU-6050 absent/err | WHO_AM_I!=0x68 / I2C NAK | `status.mpu=1`, `i2c_err++` | tilt = neutral; cutoff/octave use safe defaults; instrument still plays distance->pitch |
+| MCP9808 absent/err | ID mismatch / NAK | `status.mcp=1`, `i2c_err++` | `temp_c` holds last; no effect on M1/M2 core; Track-B detune disabled |
+| HC-SR04 no echo | no falling edge <=38 ms | `status.sr04=1` | hold last `dist_mm`; pitch holds (no jump); optionally fade gate |
+| I2C bus stuck | HAL error / timeout | `i2c_err++` | bus recovery (clock pulses / reinit); sensors flagged until back |
+| Audio fault | DMA error / init fail | `status.audio=1` | `audio_set_master_gain(0)`; never emit garbage to DAC |
+| Servo unpowered | (no electrical sense) | `status.servo` best-effort | command continues; LD4 overcurrent -> external 5V (hardware note) |
+
+**Invariant:** any sensor loss -> status flag red + audio holds last/safe; the headline kit
+(IMU -> servo + LED) still demos even with no speaker.
+
+---
+
+## 8. On-target BIST (`selftest` command)
+
+Runs on `{"cmd":"selftest"}`; prints `PASS/FAIL` per subsystem and sets `status` flags:
+1. **I2C scan** - MPU `WHO_AM_I==0x68`; MCP `MFR_ID==0x0054`.
+2. **DAC tone** - 440 Hz / 200 ms burst on PA4.
+3. **Servo sweep** - min -> center -> max -> center.
+4. **HC-SR04 ping** - one measurement, print mm.
+5. **LED test** - LD2 (+ extra LEDs) blink.
+
+---
+
+## 9. Acceptance criteria
+
+### 9.1 M0 (bring-up)
+| ID | Criterion |
+|----|-----------|
+| M0-AC1 | LD2 blinks at a visible rate. |
+| M0-AC2 | `{"t":<ms>,"hb":1}` NDJSON appears on VCP @115200, ~1 Hz, parseable. |
+
+### 9.2 M1 "Reliable Hum"
+| ID | Criterion |
+|----|-----------|
+| M1-AC1 | I2C1 brings up MPU-6050 + MCP9808; `selftest` reports both present. |
+| M1-AC2 | `dist_mm` tracks hand height 50-500 mm; out-of-range clamps; no-echo sets `status.sr04=1`. |
+| M1-AC3 | Audible tone whose pitch follows distance per 3.1 (220-880 Hz), de-jittered (smoothing). |
+| M1-AC4 | Tilt gates audio and shifts octave per 3.2 with hysteresis (no flutter at bin edges). |
+| M1-AC5 | Servo + LED act as VU per 3.5. |
+| M1-AC6 | Full base telemetry JSON emitted ~30 Hz, non-blocking (audio/tone never stalls during TX). |
+| M1-AC7 | `selftest` BIST runs all 5 checks and sets status flags correctly. |
+| M1-AC8 | Unplug HC-SR04 -> `status.sr04` red, audio holds last/safe (graceful degradation). |
+
+### 9.3 M2 "CORDIC Synth"
+| ID | Criterion |
+|----|-----------|
+| M2-AC1 | DAC1 outputs a CORDIC-wavetable sine at 32 kHz via TIM6/DMA; measured pitch = mapped `synth_hz` within +-3 cents. |
+| M2-AC2 | Wavetable matches a reference sine (host unit test, section 10) within tolerance; no audible aliasing at top of range. |
+| M2-AC3 | FMAC IIR LPF cutoff follows tilt per 3.3 (200 Hz-8 kHz); sweep is click-free at tilt rates. |
+| M2-AC4 | Vibrato/volume respond to roll per 3.4. |
+| M2-AC5 | Voice 0 fully driven through frozen `audio_engine.h` API (no internal pokes from mapping layer). |
+| M2-AC6 | Audio glitch-free: telemetry TX non-blocking; no `HAL_Delay`/heavy work in ISRs; shared vars `volatile`. |
+| M2-AC7 | FMAC fallback path (software biquad) verified to drop in if hardware filter is disabled. |
+
+---
+
+## 10. Host unit-test targets (Phase 3a - written before code)
+
+Pure-logic, compiled on host (clang, no hardware):
+- `distance->hz` and `tilt->cutoff/vibrato` mapping: ranges, clamps, smoothing step-response.
+- CORDIC angle scaling & wavetable correctness vs `sin()` reference (per-entry error bound).
+- FMAC q1.15 coefficient generation (RBJ -> normalize -> negate-a -> prescale) vs reference.
+- Telemetry serialize + command parse round-trip.
+
+(On-target BIST in section 8 covers the hardware half; full TEST MATRIX is produced in Phase 3.)
+
+---
+
+## 11. Frontend scope (Phase 5 - `src/core/*`, summary; detail in plan)
+
+Vite + React + uPlot + Web Serial, zero backend, localhost. Connect/disconnect (user gesture),
+NDJSON parser, **StatusPanel** (per-sensor present/OK/age + i2c_err + audio/servo), charts
+(roll/pitch, dist_mm, temp_c, synth_hz, servo_deg), M2 **SynthScope** + cutoff gauge, command box.
+Renders Track B showpiece panels only if their telemetry fields appear. Track A does **not** touch
+`src/showpiece/*`.
+
+---
+
+## 12. Defaults chosen (override any at review)
+
+1. Distance window **50-500 mm**, **2-octave** exponential map from **A3 = 220 Hz**, closer = lower.
+2. Cutoff map **200 Hz-8 kHz** from pitch **-45deg...+45deg**; smoothing taus per section 3.
+3. Audio **32 kHz**, 1024-entry q1.15 wavetable, 64-sample double-buffer in SRAM1.
+4. FMAC single biquad, prescale /2 / R=1; CMSIS-DSP float biquad as fallback.
+5. Telemetry **115200** 8N1 (raise to 921600 later for a smoother scope).
+
+---
+
+## 13. Sources
+
+- **RM0440** (STM32G4 ref manual): section 17 CORDIC, 21 FMAC, 22 DAC, 11 DMA/DMAMUX, 28-29 TIM3/4/6,
+  35 I2C.
+- **STM32CubeG4** examples: `CORDIC_CosSin`, `CORDIC_Sin_DMA`, `FMAC_IIR_ITToPolling`,
+  `DAC_*`, `TIM_InputCapture`, `TIM_PWMOutput`.
+- **AN5305** (FMAC DSP), **AN5325** (CORDIC).
+- VictorTagayun `NUCLEO-G474RE_RealTime_FIR_IIR_FMAC` (FMAC polling pattern @50 kHz).
+- Component datasheets: MPU-6050 PS rev 3.4, MCP9808 DS20005095B, HC-SR04, SG90.
+- Web Serial: MDN + developer.chrome.com/docs/capabilities/serial; uPlot `leeoniya/uPlot`.
+
+---
+
+**REVIEW GATE 1 - review/approve this spec before Phase 2 plan.**

@@ -9,9 +9,11 @@
  * TELEMETRY_HOST_BUILD is not defined.
  */
 
-#define TELEMETRY_HOST_BUILD   /* remove on-target transport for host tests */
 #include "telemetry.h"
-#undef  TELEMETRY_HOST_BUILD
+
+#ifndef TELEMETRY_HOST_BUILD
+#include "stm32g4xx_hal.h"
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -197,3 +199,58 @@ CmdCode telemetry_parse_cmd(const char *json, ParsedCmd *out)
 
     return out->code;
 }
+
+#ifndef TELEMETRY_HOST_BUILD
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Minimal on-target transport
+ *
+ * The full non-blocking DMA/ring transport still lives in Track A's Phase 4
+ * backlog. This implementation is intentionally tiny so firmware links now;
+ * BIST can print PASS/FAIL lines, and the higher-priority audio ISR remains
+ * isolated from telemetry calls. Do not call telemetry_send() from an ISR.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static UART_HandleTypeDef *s_uart = NULL;
+static cmd_callback_t s_cmd_cb = NULL;
+
+void telemetry_init(struct __UART_HandleTypeDef *huart)
+{
+    s_uart = (UART_HandleTypeDef *)huart;
+}
+
+void telemetry_print_raw(const char *line)
+{
+    if (!s_uart || !line) return;
+
+    size_t len = strlen(line);
+    if (len > UINT16_MAX) len = UINT16_MAX;
+
+    (void)HAL_UART_Transmit(s_uart, (uint8_t *)line, (uint16_t)len, 20);
+}
+
+void telemetry_send(const TelemetryFrame_t *frame)
+{
+    char line[256];
+    int n = telemetry_serialize(line, sizeof(line), frame);
+    if (n > 0 && n < (int)sizeof(line)) {
+        telemetry_print_raw(line);
+    }
+}
+
+void telemetry_poll(void)
+{
+    /* Reserved for the Phase 4 non-blocking UART ring/DMA transport. */
+}
+
+void telemetry_rx_irq(void)
+{
+    /* Reserved for command receive buffering. */
+}
+
+void telemetry_register_cmd_cb(cmd_callback_t cb)
+{
+    s_cmd_cb = cb;
+}
+
+#endif /* TELEMETRY_HOST_BUILD */
