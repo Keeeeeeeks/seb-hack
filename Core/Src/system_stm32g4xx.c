@@ -18,7 +18,7 @@
  * AHB/APB prescalers: all ÷1 → all buses at 170 MHz.
  */
 
-#include "stm32g4xx_hal.h"
+#include "main.h"
 
 /* CMSIS required global */
 uint32_t SystemCoreClock = 16000000UL; /* updated by SystemCoreClockUpdate() */

@@ -12,12 +12,18 @@ project(air-synth
 # ---- Target MCU --------------------------------------------------------
 set(MCU_FAMILY   STM32G4xx)
 set(MCU_MODEL    STM32G474xx)
-set(CPU_FLAGS    "-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard")
+set(CPU_FLAGS
+    -mcpu=cortex-m4
+    -mthumb
+    -mfpu=fpv4-sp-d16
+    -mfloat-abi=hard
+)
 
 # ---- Compiler flags ----------------------------------------------------
-set(COMMON_FLAGS "${CPU_FLAGS} -Wall -Wextra -fdata-sections -ffunction-sections")
+string(JOIN " " CPU_FLAGS_STR ${CPU_FLAGS})
+set(COMMON_FLAGS "${CPU_FLAGS_STR} -Wall -Wextra -fdata-sections -ffunction-sections")
 set(CMAKE_C_FLAGS   "${COMMON_FLAGS} -std=gnu11")
-set(CMAKE_ASM_FLAGS "${CPU_FLAGS} -x assembler-with-cpp")
+set(CMAKE_ASM_FLAGS "${CPU_FLAGS_STR} -x assembler-with-cpp")
 
 set(CMAKE_C_FLAGS_DEBUG   "-Og -g3 -DDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")

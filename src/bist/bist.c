@@ -19,6 +19,7 @@
 
 /* ── On-target includes ───────────────────────────────────────────────── */
 #ifndef BIST_HOST_BUILD
+#include <stdio.h>
 #include "stm32g4xx_hal.h"
 
 /* External handles declared in main.c / MX_xxx_Init */
