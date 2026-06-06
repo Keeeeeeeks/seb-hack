@@ -1,5 +1,6 @@
 #include "audio_engine.h"
 #include "audio_engine_sim.h"
+#include "fx_detune.h"
 #include "wav.h"
 
 #include <math.h>
@@ -117,7 +118,7 @@ static void apply_event(const Event *ev, TelemetryState *telemetry) {
             filter_set_q(ev->value);
             break;
         case EV_BASE:
-            voice_set_freq(ev->voice, ev->value);
+            fx_detune_set_base(ev->voice, ev->value);
             if (ev->voice == 0) telemetry->synth_hz = ev->value;
             break;
         case EV_GAIN:
@@ -170,6 +171,7 @@ int main(int argc, char **argv) {
     if (!audio) return 4;
 
     audio_init(SAMPLE_RATE_HZ);
+    fx_detune_init();
     TelemetryState telemetry = {
         .temp_c = 25.0f,
         .detune_c = 0.0f,
@@ -188,6 +190,8 @@ int main(int argc, char **argv) {
     int next_event = 0;
     int next_frame_sample = 0;
     int frame_index = 0;
+    int next_fx_sample = 0;
+    int fx_index = 0;
     int samples_per_frame_floor = (int)(SAMPLE_RATE_HZ / TELEMETRY_HZ);
 
     for (int i = 0; i < sample_count; ++i) {
@@ -195,6 +199,14 @@ int main(int argc, char **argv) {
         while (next_event < event_count && events[next_event].t_s <= now_s) {
             apply_event(&events[next_event], &telemetry);
             next_event++;
+        }
+
+        if (i >= next_fx_sample) {
+            fx_detune_update(telemetry.temp_c, 1.0f / (float)TELEMETRY_HZ);
+            telemetry.detune_c = fx_detune_get_cents();
+            fx_index++;
+            next_fx_sample = (int)((double)fx_index * (double)SAMPLE_RATE_HZ / (double)TELEMETRY_HZ);
+            if (next_fx_sample <= i) next_fx_sample = i + samples_per_frame_floor;
         }
 
         sim_render(&audio[i], 1);

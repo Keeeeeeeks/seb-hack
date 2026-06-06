@@ -11,11 +11,14 @@ include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/../include
   ${CMAKE_CURRENT_SOURCE_DIR}/../tests
+  ${CMAKE_CURRENT_SOURCE_DIR}/../fx_detune
 )
 
 add_library(audio_engine_sim audio_engine_sim.c)
 add_library(wav wav.c)
+add_library(fx_detune ../fx_detune/fx_detune.c)
+target_link_libraries(fx_detune PRIVATE audio_engine_sim m)
 add_executable(track_b_harness harness.c)
-target_link_libraries(track_b_harness PRIVATE audio_engine_sim wav m)
+target_link_libraries(track_b_harness PRIVATE fx_detune audio_engine_sim wav m)
 
 enable_testing()
