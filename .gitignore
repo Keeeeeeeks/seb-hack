@@ -1,0 +1,5 @@
+# Track B host build/output scratch
+build-track-b*/
+out.wav
+out.csv
+telemetry.ndjson
