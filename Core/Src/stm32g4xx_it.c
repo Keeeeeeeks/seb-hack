@@ -4,11 +4,12 @@
  * Rules (from SEB.MD):
  *  - No HAL_Delay / heavy work in ISRs
  *  - Shared state must be volatile
- *  - Audio DMA ISR = highest priority; LPUART TX = lowest
+ *  - Audio sample ISR = highest priority; LPUART TX = lowest
  */
 
 #include "main.h"
 #include "stm32g4xx_it.h"
+#include "audio_engine.h"
 
 /* ---- External handles (defined in main.c) ------------------------------ */
 extern UART_HandleTypeDef  hlpuart1;
@@ -60,7 +61,7 @@ void PendSV_Handler(void)
 
 /**
  * SysTick_Handler — 1 ms tick for HAL timebase.
- * Priority: TICK_INT_PRIORITY (15, lowest) so audio DMA is never blocked.
+ * Priority: TICK_INT_PRIORITY (15, lowest) so audio is never blocked.
  */
 void SysTick_Handler(void)
 {
@@ -82,17 +83,18 @@ void TIM4_IRQHandler(void)
 }
 
 /**
- * TIM6_DAC_IRQHandler — TIM6 update (audio sample clock) + DAC underrun.
- * Priority: highest (audio DMA).
+ * TIM6_DAC_IRQHandler — audio sample clock.
+ * Priority: highest; writes the next PA4 DAC sample directly.
  */
 void TIM6_DAC_IRQHandler(void)
 {
-    HAL_TIM_IRQHandler(&htim6);
+    (void)htim6;
+    audio_tim6_irq();
 }
 
 /**
- * DMA1_Channel1_IRQHandler — DAC1 CH1 DMA (audio circular buffer).
- * Priority: highest.
+ * DMA1_Channel1_IRQHandler — reserved for M2 DAC1 CH1 DMA audio.
+ * Priority: highest when DMA audio is enabled.
  */
 void DMA1_Channel1_IRQHandler(void)
 {

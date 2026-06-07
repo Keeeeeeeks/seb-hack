@@ -6,15 +6,14 @@
  *   ✓ 170 MHz clock via HSI16 PLL
  *   ✓ LPUART1 @ 115200 baud (PA2 TX / PA3 RX, AF12)
  *   ✓ LD2 heartbeat blink (PA5, 500 ms)
- *   ✓ 1 Hz JSON telemetry frame over LPUART1
+ *   ✓ 10 Hz rich JSON telemetry frame over LPUART1
  *   ✓ HC-SR04 distance measurement (TIM4 input-capture, PB6)
- *   ✓ DAC1 CH1 (PA4) + TIM6 DMA audio skeleton (silent wavetable)
+ *   ✓ DAC1 CH1 (PA4) + TIM6 IRQ audio engine
  *   ✓ I2C1 (PB8/PB9) initialised for IMU (M2)
  *   ✓ TIM3 CH1 (PB4) 50 Hz PWM for servo (M2)
  *
  * NVIC priority scheme (lower number = higher priority):
- *   0  — DMA1_Channel1 (audio DAC DMA)
- *   1  — TIM6_DAC      (audio sample clock)
+ *   0  — TIM6_DAC      (audio sample clock)
  *   2  — TIM4          (HC-SR04 echo capture)
  *  15  — SysTick / LPUART1 (telemetry TX)
  */
@@ -24,6 +23,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+#include "audio_engine.h"
+#include "mapping.h"
+#include "mcp9808.h"
+#include "mpu6050.h"
+#include "telemetry.h"
 
 /* ======================================================================== */
 /* Peripheral handles                                                        */
@@ -35,16 +40,6 @@ TIM_HandleTypeDef   htim6;
 I2C_HandleTypeDef   hi2c1;
 DAC_HandleTypeDef   hdac1;
 DMA_HandleTypeDef   hdma_dac1_ch1;
-
-/* ======================================================================== */
-/* Audio wavetable (Phase 0: silence — 12-bit DAC, 256 samples)            */
-/* Placed in SRAM1 (DMA-accessible). CCM SRAM is NOT DMA-accessible.       */
-/* ======================================================================== */
-#define WAVETABLE_LEN  256U
-#define DAC_MIDPOINT   2048U   /* 12-bit mid-scale = 0 V on AC-coupled out */
-
-static uint16_t __attribute__((section(".data")))
-    g_wavetable[WAVETABLE_LEN];
 
 /* ======================================================================== */
 /* HC-SR04 distance measurement state                                       */
@@ -63,6 +58,17 @@ typedef struct {
 } Hcsr04State;
 
 static Hcsr04State g_sonar = {0};
+
+/* ======================================================================== */
+/* Live sensor/audio telemetry state                                         */
+/* ======================================================================== */
+#define FALLBACK_TEMP_C  25.0f
+#define AUDIO_SAMPLE_RATE_HZ  44100U
+
+static uint8_t     g_mpu_addr = MPU6050_ADDR_DEFAULT;
+static bool        g_mpu_present = false;
+static bool        g_mcp_present = false;
+static StatusFlags g_status = {0};
 
 /* ======================================================================== */
 /* Telemetry ring buffer (ISR-safe, single-producer single-consumer)        */
@@ -86,6 +92,8 @@ static void MX_DAC1_Init(void);
 
 static void     Sonar_Trigger(void);
 static uint32_t Sonar_GetDistance_cm(void);
+static void     Sensors_Init(void);
+static void     Build_Telemetry_Frame(uint32_t tick_ms, TelemetryFrame_t *frame);
 static void     Telem_Send(const char *json, uint16_t len);
 static void     Telem_Flush(void);
 
@@ -110,18 +118,11 @@ int main(void)
     MX_I2C1_Init();
     MX_DAC1_Init();
 
-    /* Fill wavetable with DC mid-point (silence) */
-    for (uint32_t i = 0; i < WAVETABLE_LEN; i++) {
-        g_wavetable[i] = DAC_MIDPOINT;
-    }
-
-    /* Start audio DMA (circular, TIM6-triggered) */
-    HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1,
-                      (uint32_t *)g_wavetable, WAVETABLE_LEN,
-                      DAC_ALIGN_12B_R);
-
-    /* Start TIM6 (audio sample clock) */
-    HAL_TIM_Base_Start(&htim6);
+    mapping_init();
+    Sensors_Init();
+    audio_init(AUDIO_SAMPLE_RATE_HZ);
+    audio_set_master_gain(0.5f);
+    voice_set_gain(0, 0.6f);
 
     /* Start TIM3 CH1 PWM (servo, 50 Hz, 1.5 ms neutral) */
     HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
@@ -130,12 +131,12 @@ int main(void)
     HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_1);
 
     /* ------------------------------------------------------------------ */
-    /* Main loop — 1 Hz telemetry + 100 ms sonar poll                     */
+    /* Main loop — 10 Hz telemetry + 100 ms sonar poll                    */
     /* ------------------------------------------------------------------ */
     uint32_t last_telem_ms = 0;
     uint32_t last_sonar_ms = 0;
     uint32_t tick_ms;
-    char     json_buf[128];
+    char     json_buf[256];
 
     while (1) {
         tick_ms = HAL_GetTick();
@@ -146,23 +147,25 @@ int main(void)
             Sonar_Trigger();
         }
 
-        /* Telemetry: emit JSON every 1000 ms */
-        if ((tick_ms - last_telem_ms) >= 1000U) {
+        /* Telemetry: emit rich sensor/audio JSON every 100 ms */
+        if ((tick_ms - last_telem_ms) >= 100U) {
             last_telem_ms = tick_ms;
 
-            uint32_t dist_cm = Sonar_GetDistance_cm();
+            TelemetryFrame_t frame;
+            Build_Telemetry_Frame(tick_ms, &frame);
 
-            int n = snprintf(json_buf, sizeof(json_buf),
-                "{\"t\":%lu,\"dist_cm\":%lu,\"led\":%d}\r\n",
-                (unsigned long)tick_ms,
-                (unsigned long)dist_cm,
-                (HAL_GPIO_ReadPin(LED_PORT, LED_PIN) == GPIO_PIN_SET) ? 1 : 0);
+            uint32_t servo_ccr = 1000U + (uint32_t)((frame.audio.servo_deg / 180.0f) * 1000.0f);
+            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, servo_ccr);
+            voice_set_freq(0, frame.audio.filt_hz);
+            filter_set_cutoff(frame.audio.cutoff_hz);
+
+            int n = telemetry_serialize(json_buf, sizeof(json_buf), &frame);
 
             if (n > 0 && n < (int)sizeof(json_buf)) {
                 Telem_Send(json_buf, (uint16_t)n);
             }
 
-            /* Heartbeat LED toggle */
+            /* Heartbeat LED toggle: proves firmware main loop is alive. */
             HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
         }
 
@@ -241,14 +244,14 @@ static void MX_GPIO_Init(void)
 }
 
 /* ======================================================================== */
-/* DMA init — must be called before DAC init                                */
+/* DMA init — reserved for M2 DAC DMA path                                  */
 /* ======================================================================== */
 static void MX_DMA_Init(void)
 {
     __HAL_RCC_DMAMUX1_CLK_ENABLE();
     __HAL_RCC_DMA1_CLK_ENABLE();
 
-    /* DMA1 Channel 1 → DAC1 CH1 (DMAMUX request 6) */
+    /* DMA1 Channel 1 → DAC1 CH1 (DMAMUX request 6), inactive in M1. */
     hdma_dac1_ch1.Instance                 = DMA1_Channel1;
     hdma_dac1_ch1.Init.Request             = DMA_REQUEST_DAC1_CHANNEL1;
     hdma_dac1_ch1.Init.Direction           = DMA_MEMORY_TO_PERIPH;
@@ -266,7 +269,7 @@ static void MX_DMA_Init(void)
     /* Link DMA handle to DAC handle */
     __HAL_LINKDMA(&hdac1, DMA_Handle1, hdma_dac1_ch1);
 
-    /* NVIC: DMA1 Channel 1 — highest priority (audio) */
+    /* NVIC: DMA1 Channel 1 — reserved at high priority for M2 audio DMA. */
     HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 }
@@ -381,12 +384,9 @@ static void MX_TIM4_Init(void)
 }
 
 /* ======================================================================== */
-/* TIM6 — audio sample clock (triggers DAC DMA)                             */
-/* Sample rate: 44100 Hz                                                    */
-/* PSC = 0, ARR = (170 MHz / 44100) - 1 ≈ 3854                            */
+/* TIM6 — audio sample clock                                                */
+/* audio_engine sets PSC/ARR dynamically so PA4 follows mapped filt_hz.     */
 /* ======================================================================== */
-#define AUDIO_SAMPLE_RATE_HZ  44100U
-
 static void MX_TIM6_Init(void)
 {
     TIM_MasterConfigTypeDef sMasterConfig = {0};
@@ -394,25 +394,25 @@ static void MX_TIM6_Init(void)
     __HAL_RCC_TIM6_CLK_ENABLE();
 
     htim6.Instance               = TIM6;
-    htim6.Init.Prescaler         = 0;
+    htim6.Init.Prescaler         = 169;
     htim6.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim6.Init.Period            = (170000000U / AUDIO_SAMPLE_RATE_HZ) - 1U;
+    htim6.Init.Period            = (1000000U / (440U * AUDIO_WAVETABLE_N)) - 1U;
     htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
 
     if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
         Error_Handler();
     }
 
-    /* TIM6 TRGO → triggers DAC DMA on update event */
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+    /* TIM6 interrupt drives DAC writes directly in audio_engine. */
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
     sMasterConfig.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
 
     if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK) {
         Error_Handler();
     }
 
-    /* NVIC: TIM6 — high priority (audio) */
-    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 1, 0);
+    /* NVIC: TIM6 — highest priority (audio) */
+    HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
 }
 
@@ -448,7 +448,7 @@ static void MX_I2C1_Init(void)
 }
 
 /* ======================================================================== */
-/* DAC1 CH1 — 12-bit right-aligned, triggered by TIM6 TRGO                */
+/* DAC1 CH1 — 12-bit right-aligned, PA4 speaker amp input                  */
 /* ======================================================================== */
 static void MX_DAC1_Init(void)
 {
@@ -466,7 +466,7 @@ static void MX_DAC1_Init(void)
     sConfig.DAC_DMADoubleDataMode     = DISABLE;
     sConfig.DAC_SignedFormat          = DISABLE;
     sConfig.DAC_SampleAndHold         = DAC_SAMPLEANDHOLD_DISABLE;
-    sConfig.DAC_Trigger               = DAC_TRIGGER_T6_TRGO;
+    sConfig.DAC_Trigger               = DAC_TRIGGER_NONE;
     sConfig.DAC_Trigger2              = DAC_TRIGGER_NONE;
     sConfig.DAC_OutputBuffer          = DAC_OUTPUTBUFFER_ENABLE;
     sConfig.DAC_ConnectOnChipPeripheral = DAC_CHIPCONNECT_EXTERNAL;
@@ -475,6 +475,83 @@ static void MX_DAC1_Init(void)
     if (HAL_DAC_ConfigChannel(&hdac1, &sConfig, DAC_CHANNEL_1) != HAL_OK) {
         Error_Handler();
     }
+}
+
+/* ======================================================================== */
+/* Sensor sampling + telemetry assembly                                      */
+/* ======================================================================== */
+static void Sensors_Init(void)
+{
+    if (mpu6050_init(&hi2c1, MPU6050_ADDR_DEFAULT) == MPU6050_OK) {
+        g_mpu_addr = MPU6050_ADDR_DEFAULT;
+        g_mpu_present = true;
+        g_status.mpu = 0;
+    } else if (mpu6050_init(&hi2c1, MPU6050_ADDR_ALT) == MPU6050_OK) {
+        g_mpu_addr = MPU6050_ADDR_ALT;
+        g_mpu_present = true;
+        g_status.mpu = 0;
+    } else {
+        g_mpu_present = false;
+        g_status.mpu = 1;
+    }
+
+    g_mcp_present = (mcp9808_init(&hi2c1, MCP9808_ADDR_DEFAULT) == MCP9808_OK);
+    g_status.mcp = g_mcp_present ? 0 : 1;
+    g_status.sr04 = 0;
+    g_status.audio = 0;
+    g_status.servo = 0;
+    g_status.i2c_err = 0;
+}
+
+static void Build_Telemetry_Frame(uint32_t tick_ms, TelemetryFrame_t *frame)
+{
+    Mpu6050Data imu = {0};
+    float temp_c = FALLBACK_TEMP_C;
+
+    if (g_mpu_present && mpu6050_read(&hi2c1, g_mpu_addr, &imu) == MPU6050_OK) {
+        g_status.mpu = 0;
+    } else {
+        g_status.mpu = 1;
+        g_status.i2c_err++;
+    }
+
+    if (g_mcp_present && mcp9808_read_temp(&hi2c1, MCP9808_ADDR_DEFAULT, &temp_c) == MCP9808_OK) {
+        g_status.mcp = 0;
+    } else {
+        g_status.mcp = 1;
+        temp_c = FALLBACK_TEMP_C;
+        g_status.i2c_err++;
+    }
+
+    uint32_t dist_cm = Sonar_GetDistance_cm();
+    float dist_mm = (float)(dist_cm * 10U);
+    if (dist_mm <= 0.0f) {
+        dist_mm = MAP_DIST_MAX_MM;
+        g_status.sr04 = 1;
+    } else {
+        g_status.sr04 = 0;
+    }
+
+    SensorState sensor = {
+        .dist_filt_mm = dist_mm,
+        .roll_deg = imu.roll_deg,
+        .pitch_deg = imu.pitch_deg,
+        .temp_c = temp_c,
+    };
+
+    AudioParams audio = {0};
+    mapping_update(&sensor, &audio);
+
+    frame->sensor.t_ms = tick_ms;
+    frame->sensor.roll_deg = imu.roll_deg;
+    frame->sensor.pitch_deg = imu.pitch_deg;
+    frame->sensor.ax_g = imu.ax_g;
+    frame->sensor.ay_g = imu.ay_g;
+    frame->sensor.az_g = imu.az_g;
+    frame->sensor.dist_filt_mm = dist_mm;
+    frame->sensor.temp_c = temp_c;
+    frame->audio = audio;
+    frame->status = g_status;
 }
 
 /* ======================================================================== */

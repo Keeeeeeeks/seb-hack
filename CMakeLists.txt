@@ -57,6 +57,7 @@ set(APP_SOURCES
     # Application modules
     src/mapping/mapping.c
     src/telemetry/telemetry.c
+    src/audio_engine/audio_engine.c
     src/bist/bist.c
 )
 
@@ -92,6 +93,7 @@ set(INCLUDE_DIRS
     src/sensors
     src/mapping
     src/telemetry
+    src/audio_engine
     src/bist
     ${HAL_ROOT}/Inc
     ${CMSIS_ROOT}/Include
